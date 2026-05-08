@@ -1,8 +1,8 @@
-NAME        = PmergeMe
+NAME        = server
 CXX         = c++
 CXXFLAGS    = -Wall -Wextra -Werror -std=c++98
 
-SRCS        = main.cpp server.cpp client.cpp
+SRCS        = main.cpp Channel.cpp Client.cpp CommandHandler.cpp Server.cpp
 OBJS        = $(SRCS:.cpp=.o)
 
 all: $(NAME)
