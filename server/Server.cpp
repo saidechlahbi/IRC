@@ -1,204 +1,316 @@
-// Server.cpp
-
 #include "Server.hpp"
-#include <iostream>
-#include <sys/socket.h>
-#include <unistd.h>
-#include <netinet/in.h>
-#include <cstring>
-#include <poll.h>
+#include <sstream>
 
-Server::Server(int port, const std::string& password)
-    : _port(port), _password(password) {
-    // Create server socket
-    _serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (_serverSocket < 0)
-        throw std::runtime_error("Failed to create socket");
+bool Server::keep_running = true;
 
-    sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(_port);
-
-    if (bind(_serverSocket, (struct sockaddr*)&addr, sizeof(addr)) < 0)
-        throw std::runtime_error("Bind failed");
-
-    if (listen(_serverSocket, 10) < 0)
-        throw std::runtime_error("Listen failed");
-
-    std::cout << "Server started on port " << _port << std::endl;
+Server::Server(int port, std::string password) : _port(port), _pass(password){
 }
 
 Server::~Server() {
-    for (std::vector<Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it) {
-        delete *it;
-    }
-    for (std::map<std::string, Channel*>::iterator it = _channels.begin(); it != _channels.end(); ++it) {
-        delete it->second;
+}
+
+void    Server::init()
+{
+    struct sockaddr_in localaddr;
+    memset(&localaddr, 0, sizeof(localaddr));
+    localaddr.sin_addr.s_addr = inet_addr("127.0.0.1"); //just for now; testing on my machine lese i need to put a macro instead of direct value
+    localaddr.sin_family = AF_INET;
+    localaddr.sin_port = htons(_port);
+    // localaddr.sin_zero  NEED TO READ MORE ABOUT THIS VAR
+    _ss = socket(AF_INET, SOCK_STREAM ,0);
+    if (_ss < 0)
+        throw std::runtime_error("Sokcet failed");
+    fcntl(_ss, F_SETFL, O_NONBLOCK);
+    int opt = 1;
+    setsockopt(_ss, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (bind(_ss, (sockaddr *)&localaddr, sizeof(localaddr)) < 0)
+        throw std::runtime_error("Bind failed");       
+}
+
+void Server::add_nsocket()
+{
+    struct sockaddr_in listenaddr;
+    socklen_t len = sizeof(listenaddr);
+    _ns = accept(_ss, (sockaddr*) &listenaddr, &len);
+    if (_ns < 0)
+        std::cerr << "Accept failed" << std::endl;
+    else
+    {
+        fcntl(_ns, F_SETFL, O_NONBLOCK);
+        // std::cout << "Client connecté ! Son FD est : " << _ns << std::endl;
+        Client* newClient = new Client(_ns);
+        clients.push_back(newClient);
+        std::string client_ip = inet_ntoa(listenaddr.sin_addr);// ip ktwli string 
+        newClient->setHost(client_ip);
+                            
+        struct pollfd spf;
+        spf.fd = _ns;
+        spf.events = POLLIN;
+        _v.push_back(spf);
+        _fds_buff[_ns] = "";
     }
 }
 
-void Server::run() {
-    struct pollfd fds[1024];
-    int nfds = 1;
-    fds[0].fd = _serverSocket;
-    fds[0].events = POLLIN;
-
-    // Add all client FDs
-    while (true) {
-        nfds = 1;
-        for (size_t i = 0; i < _clients.size(); ++i) {
-            fds[nfds].fd = _clients[i]->getFd();
-            fds[nfds].events = POLLIN;
-            ++nfds;
+void Server::receive_cmd(size_t &i, int current_fd)
+{
+    char buf[1024];
+    memset(buf, 0, sizeof(buf));
+    int byteread = recv(current_fd , buf, 1023, 0);
+    if (byteread <= 0)
+    {
+        for (size_t j = 0; j < clients.size(); j++)
+        {
+            if (clients[j]->getFd() == current_fd)
+            {
+                delete clients[j];
+                clients.erase(clients.begin() + j);
+                break;
+            }
         }
+        _fds_buff.erase(current_fd);
+        close(current_fd);
+        _v.erase(_v.begin() + i); // n7ydha mn vector
+        i--; //v kyn9slo size n9si bch mtn9zich chi client
+    }
+    else
+    {
+        _fds_buff[current_fd].append(buf, byteread);
+        size_t delfound = _fds_buff[current_fd].find("\r\n");
+        while (delfound != std::string::npos)
+        {
+            _cmd = _fds_buff[current_fd].substr(0, delfound);
+            handle_command(current_fd, _cmd); // you need to build this
 
-        int pollResult = poll(fds, nfds, -1);
-        if (pollResult < 0)
-            throw std::runtime_error("Poll error");
+            _fds_buff[current_fd].erase(0,delfound + 2);
+            delfound = _fds_buff[current_fd].find("\r\n");
+        } 
+    }
 
-        if (fds[0].revents & POLLIN) {
-            acceptNewClient();
-        }
+}
 
-        // Check clients for input
-        for (int i = 1; i < nfds; ++i) {
-            if (fds[i].revents & POLLIN) {
-                char buffer[512] = {0};
-                ssize_t bytes = recv(fds[i].fd, buffer, sizeof(buffer), 0);
-                if (bytes <= 0) {
-                    removeClient(fds[i].fd);
-                } else {
-                    Client* c = getClient(fds[i].fd);
-                    if (c) {
-                        c->getBuffer().append(buffer, bytes);
+void Server::build_and_listen()
+{
+    _spfd.fd = _ss;
+    _spfd.events = POLLIN;
+    _v.push_back(_spfd);
 
-                        // Example: Dispatch one line at a time
-                        size_t pos;
-                        while ((pos = c->getBuffer().find('\n')) != std::string::npos) {
-                            std::string line = c->getBuffer().substr(0, pos);
-                            c->getBuffer().erase(0, pos + 1);
-                            handleCommand(*c, line);
-                        }
-                    }
-                }
+    if (listen(_ss, 0) < 0)
+        throw std::runtime_error("Listen failed");// taille dyal file dattente < 5 si 0 on laisse le system decide 
+    while (keep_running)
+    {
+        if (poll(&_v[0], _v.size(), -1) < 0)
+            throw std::runtime_error("Poll failed");
+        for (size_t i = 0; i < _v.size(); i++)
+        {
+            if (_v[i].revents & POLLIN)
+            {
+                int current_fd = _v[i].fd;
+                if (current_fd == _ss)
+                    add_nsocket();
+
+                else
+                    receive_cmd(i, current_fd);
             }
         }
     }
+
+    for (size_t i = 0; i < _v.size(); i++)
+    {
+        close(_v[i].fd);
+    }
 }
 
-void Server::acceptNewClient() {
-    sockaddr_in client_addr = {};
-    socklen_t len = sizeof(client_addr);
-    int client_fd = accept(_serverSocket, (struct sockaddr*)&client_addr, &len);
-    if (client_fd < 0)
+Client* Server::getClientByFd(int fd)
+{
+    for (size_t i = 0; i < clients.size(); i++)
+    {
+        if (clients[i]->getFd() == fd)
+            return clients[i];
+    }
+    return NULL;
+}
+
+
+std::string Server::getPass()
+{
+    return _pass;
+}
+
+bool Server::nickIsInUse(std::string nickname)const
+{
+    for (size_t i = 0; i  < clients.size(); i++)
+    {
+        if (clients[i]->getNick() == nickname)
+            return true;
+    }
+    return false;
+}
+
+void Server::sendReply(Client* client, const std::string& code, 
+                      const std::string& nick, 
+                      const std::string& arg, 
+                      const std::string& message)
+{
+    std::string fullmsg = std::string(":") + "server" + " " + code + " " + nick;
+
+    if (!arg.empty()) fullmsg += " " + arg;
+    fullmsg += " :" + message + "\r\n";
+    client->sendRaw(fullmsg);
+}
+
+
+bool Server::is_command(std::string command)
+{
+    return (command == "PASS" || command == "NICK" || command == "USER");
+}
+
+bool Server::checkPassword(std::string& param)
+{
+    // Remove any leading whitespace
+    size_t first = param.find_first_not_of(" \t\r\n");
+    if (first != std::string::npos)
+        param = param.substr(first);
+
+    // Remove leading ':' (IRC trailing param convention, e.g. PASS :hunter2)
+    if (!param.empty() && param[0] == ':')
+        param = param.substr(1);
+
+    // Should not be empty
+    if (param.empty())
+        return false;
+
+    // IRC line total length max (including CRLF) is 512
+    if (param.length() > 510) // being strict, real limit is >510 with command
+        return false;
+
+    // Optionally, forbid spaces, but RFC allows them if param was given as trailing
+    // If you want to forbid, uncomment this:
+    // if (param.find(' ') != std::string::npos) return false;
+
+    return true;
+}
+
+bool Server::isValidNick(const std::string& nick)
+{
+    if (nick.empty() || nick.size() > 9)
+        return false;
+
+    const std::string allowedFirst = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz[]\\`^{}|";
+    const std::string allowedRest  = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-[]\\`^{}|";
+
+    if (allowedFirst.find(nick[0]) == std::string::npos)
+        return false;
+
+    for (size_t i = 1; i < nick.size(); ++i)
+    {
+        if (allowedRest.find(nick[i]) == std::string::npos)
+            return false;
+    }
+    return true;
+}
+
+
+
+
+void Server::handleJoin(Client* client, std::string param)
+{
+    
+}
+
+
+
+
+
+
+
+void Server::handle_command(int fd, std::string& line)
+{
+    Client* client = getClientByFd(fd);
+    if (!client)
         return;
-    Client* client = new Client(client_fd);
-    _clients.push_back(client);
-    std::cout << "New client connected: fd=" << client_fd << std::endl;
-}
 
-void Server::removeClient(int fd) {
-    for (std::vector<Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it) {
-        if ((*it)->getFd() == fd) {
-            close(fd);
-            delete *it;
-            _clients.erase(it);
-            std::cout << "Client disconnected: fd=" << fd << std::endl;
-            break;
+    std::string command;
+    std::string param;
+    std::istringstream iss(line);
+    iss >> command;
+    for (size_t i = 0; i < command.size(); ++i)
+        command[i] = toupper(command[i]);
+    size_t pos = line.find(' ');
+    if (pos == std::string::npos)
+        param =  "";
+    else
+        param =  line.substr(pos + 1);
+    if (!client->getisAuthorized())
+    {
+        if (!is_command(command))
+        { //421 == ERR_unkowncommand hadi bdltha
+            sendReply(client, "421", client->getNick(), command, 
+            "Unkown command");
+            return ;
+        }
+        if (param == "") // fr9thom
+        {
+            sendReply(client, "461",  client->getNick(), 
+                command, "Not enough parameters");
+            return ;
+        }
+        if (command == "PASS") // check if pass dejat t3amer 
+            handlePass(client, param);
+        else if (command == "NICK")
+            handleNick(client, param);
+        else if (command == "USER")
+            handleUser(client, param);
+        // else
+        // {
+        //         // ERR_NOTREGISTERED (451)
+        //     // :<server> 451 <nick or *> :You have not registered
+        //     sendReply(client, "451", client->getNick(), "", "You have not registered");
+        // }
+        if (client->gethasUser() && client->getnickFilled() && client->getpassFilled())
+        {
+            client->setAuthorized(true);
+            //
+                 /*001    RPL_WELCOME
+              "Welcome to the Internet Relay Network
+               <nick>!<user>@<host>" */
+            std::string wlc_msg = "Welcome to the Internet Relay Network " + client->getNick() + "!" + client->getUser() + "@" + client->getHost();
+            sendReply(client, "001", client->getNick(), "", wlc_msg);
+            // std::cout << "client :" << client->getNick() << " Successfully authentified" << std::endl;
+        }
+        
+    }
+    else
+    {
+        if (command == "PASS")
+            handlePass(client, param);
+        else if (command == "USER")
+            handleUser(client, param);
+        else if (command == "NICK")
+            handleNick(client, param);
+        else if (command == "PING")
+            handlePing(client, param);
+        else if (command == "QUIT")
+            handleQuit(client);
+        // else if (command == "PRIVMSG")
+        //     handlePrivmsg(client, param);
+        // else if (command == "PONG")
+        //     handlePong(client, param);
+
+        else if (command == "JOIN")
+            handleJoin(client, line);
+        // else if (command == "TOPIC")
+        //     handleTopic(fd, line)
+        // else if (command == "INVITE")
+        //     handleInvite(fd, line);
+        // else if (command == "MODE")
+        //     handleMode(fd, line);
+        // else if (command == "KICK")
+        //     handleKick(fd, line);
+
+        else
+        {
+            sendReply(client, "421", client->getNick(), command, "Unknown command");
+            return ;
         }
     }
 }
-
-Client* Server::getClient(int fd) {
-    for (size_t i = 0; i < _clients.size(); ++i)
-        if (_clients[i]->getFd() == fd)
-            return _clients[i];
-    return NULL;
-}
-
-std::vector<Client*>& Server::getClients() {
-    return _clients;
-}
-
-Channel* Server::getChannel(const std::string& name) {
-    std::map<std::string, Channel*>::iterator it = _channels.find(name);
-    if (it != _channels.end())
-        return it->second;
-    return NULL;
-}
-
-void Server::addChannel(const std::string& name, Channel* channel) {
-    _channels[name] = channel;
-}
-
-void Server::removeChannel(const std::string& name) {
-    std::map<std::string, Channel*>::iterator it = _channels.find(name);
-    if (it != _channels.end()) {
-        delete it->second;
-        _channels.erase(it);
-    }
-}
-
-void Server::handleCommand(Client& client, const std::string& line) {
-    // Hand off to CommandHandler, e.g.:
-    // _commandHandler.parseAndDispatch(client, line);
-    (void)client;
-    std::cout << "Received command from client: " << line << std::endl;
-}
-
-const std::string& Server::getPassword() const { return _password; }
-int Server::getPort() const { return _port; }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// #include <iostream> 
-// #include <sys/socket.h>
-// #include <netinet/in.h>
-// #include <arpa/inet.h>
-// int main ()
-// {
-//     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-//     if (server_fd == -1)
-//     {
-//         std::cout << "Error :socket failed " <<std::endl;
-//         exit(1);
-//     }
-//     struct sockaddr_in server_addr;
-//     server_addr.sin_family = AF_INET;
-//     server_addr.sin_port = htons(6667);
-//     server_addr.sin_addr.s_addr = INADDR_ANY;
-//     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof (server_addr)) == -1)
-//     {
-//         std::cout << "Error : bind failed" << std::endl;
-//         exit(1);
-//     }
-//     if (listen(server_fd, 10) == -1)
-//     {
-//         std::cout << "ERROR: listen failed" << std::endl;
-//         exit(1);
-//     }
-//     struct sockaddr_in client_addr;
-//     socklen_t client_len = sizeof(client_addr);
-//     int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-//     if (client_fd == -1)
-//     {
-//         std::cout << "Error: accept failed" << std::endl;
-//         exit(1);
-//     }
-//     std::cout << "new client from:" << ":"
-//     << inet_ntoa(client_addr.sin_addr)
-//     << ntohs(client_addr.sin_port)
-//     << std::endl;
-// }

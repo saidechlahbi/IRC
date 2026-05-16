@@ -1,21 +1,24 @@
-NAME        = server
-CXX         = c++
-CXXFLAGS    = -Wall -Wextra -Werror -std=c++98
+NAME = ircserv
+CXX = c++
+CXXFLAGS = -Wall -Wextra -Werror -std=c++98
+SRC = main.cpp Server.cpp Channel.cpp Client.cpp \
+	handle_cmds.cpp
+OBJ = $(SRC:.cpp=.o)
 
-SRCS        = main.cpp Channel.cpp Client.cpp CommandHandler.cpp Server.cpp
-OBJS        = $(SRCS:.cpp=.o)
+all : $(NAME)
 
-all: $(NAME)
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(NAME): $(OBJS)
-	$(CXX) $(CXXFLAGS) $(OBJS) -o $(NAME)
+$(NAME): $(OBJ)
+	$(CXX) $(CXXFLAGS) $(OBJ) -o $(NAME)
 
-clean:
-	rm -f $(OBJS)
+clean :
+	rm -f $(OBJ)
 
-fclean: clean
+fclean : clean
 	rm -f $(NAME)
 
-re: fclean all
+re : fclean all
 
-.PHONY: all clean fclean re
+.PHONY : clean fclean all re
